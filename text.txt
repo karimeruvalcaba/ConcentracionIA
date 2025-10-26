@@ -1,0 +1,205 @@
+# Create the output directory if it doesn't exist
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Read the CSV
+df = pd.read_csv(DATA_PATH, encoding='latin1')
+
+#= CONTROL DE COSTOS =======
+N_SAMPLE = 30     # número de instancias de test para pruebas rápidas
+MAX_CALLS = 50    # tope de llamadas a la API (ajuste según presupuesto)
+API_CALLS_USED = 0
+
+def check_quota():
+    """Verifica y consume 1 crédito de llamada a la API."""
+    global API_CALLS_USED
+    if API_CALLS_USED >= MAX_CALLS:
+        raise RuntimeError(
+            f"Se alcanzó el límite de {MAX_CALLS} llamadas a la API. "
+            f"Aumente MAX_CALLS o reduzca el dataset de prueba (N_SAMPLE)."
+        )
+    API_CALLS_USED += 1
+
+
+# Candidatos de nombres de columna
+TEXT_CANDIDATES = ["text","texto","review","content","sentence","tweet","document"]
+LABEL_CANDIDATES = ["label","labels","etiqueta","etiquetas","sentiment","Sentiment","target","y"]
+
+def load_dataset(path: str):
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"No se encontró el archivo en: {p}")
+
+    if p.suffix.lower() in [".csv", ".tsv"]:
+        sep = "," if p.suffix.lower()==".csv" else "\t"
+        df = pd.read_csv(p, sep=sep)
+    elif p.suffix.lower() in [".parquet", ".pq"]:
+        df = pd.read_parquet(p)
+    elif p.suffix.lower() in [".xls", ".xlsx"]:
+        # Lee primera hoja por defecto; puede especificarse sheet_name si es necesario
+        df = pd.read_excel(p, engine="openpyxl")
+    else:
+        # Intento por defecto: leer como CSV
+        df = pd.read_csv(p)
+    return df
+
+
+df = load_dataset(DATA_PATH).copy()
+#print("Tamaño bruto:", len(df))
+
+# --- Limit to 6 rows (after your existing df cleaning) ---
+expected_cols = {"platform", "text", "Sentiment"}
+missing = expected_cols - set(df.columns)
+if missing:
+    raise ValueError(f"El CSV no tiene columnas esperadas: falta(n) {missing}")
+
+sample_df = df.head(6).copy().reset_index(drop=True)
+
+# --- Prompt template (with definitions, examples, and strict JSON format) ---
+def build_prompt(query: str) -> str:
+    return f"""Sentiment Classification + Explanation Prompt
+You are an NLP assistant for sentiment analysis.
+Given a WhatsApp message (QUERY), classify its sentiment as Positive, Negative, or Neutral.
+Provide a justification using extracted keywords and a brief explanation.
+Return your confidence score (0–5). Use JSON output format only.
+
+Sentiment definitions:
+- Positive: expresses favorable emotions, praise, satisfaction, excitement, happiness, or support.
+- Neutral: informational/ factual/ ambiguous tone without clear positive or negative emotion; mixed content where polarity cannot be determined.
+- Negative: expresses criticism, dissatisfaction, concern, anger, sadness, fear, or complaint.
+
+Examples (illustrative):
+
+Example 1 (clear positive)
+QUERY: "Me encantó el producto, llegó rapidísimo y funciona perfecto."
+Output Format:
+{{
+  "justification": {{
+    "keywords": ["encantó", "rapidísimo", "perfecto"],
+    "explanation": "Palabras de alta valencia positiva y satisfacción explícita."
+  }},
+  "sentiment": "Positive",
+  "confidence_score": "4.5"
+}}
+
+Example 2 (neutral/informativo)
+QUERY: "La entrega está programada para el viernes por la tarde."
+Output Format:
+{{
+  "justification": {{
+    "keywords": ["programada", "viernes", "tarde"],
+    "explanation": "Mensaje descriptivo sin emoción explícita."
+  }},
+  "sentiment": "Neutral",
+  "confidence_score": "4.2"
+}}
+
+Example 3 (ambigua / posible negativo)
+QUERY: "No sé si valió la pena, esperaba algo mejor."
+Output Format:
+{{
+  "justification": {{
+    "keywords": ["no sé", "esperaba algo mejor"],
+    "explanation": "Expresa duda e insatisfacción; inclinación negativa."
+  }},
+  "sentiment": "Negative",
+  "confidence_score": "4.0"
+}}
+
+JSON Output Format (use exactly these keys):
+{{
+  "justification": {{
+    "keywords": [ ... ],
+    "explanation": "..."
+  }},
+  "sentiment": "...",             # One of: Positive | Neutral | Negative
+  "confidence_score": "..."       # Stringified number 0–5 (you choose decimals)
+}}
+
+QUERY: "{query}"
+"""
+
+# --- LLM classify function using your OpenAI client ---
+def classify_sentiment_llm(text: str) -> dict:
+    check_quota()  # consume 1 API "credit" from your MAX_CALLS guard
+    prompt = build_prompt(text)
+
+    # Choose a model you have access to; "gpt-4o-mini" is cost-effective.
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a careful NLP assistant. "
+                    "Return ONLY valid JSON per the schema. Do not include extra text."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+
+    raw = resp.choices[0].message.content
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        # Fallback: try to salvage JSON if the model added stray text (should be rare with response_format)
+        raw_fixed = raw.strip()
+        parsed = json.loads(raw_fixed)
+    return parsed
+
+# --- Run classification over 6 rows ---
+results = []
+aug_rows = []
+for i, row in sample_df.iterrows():
+    text = str(row["text"]).strip()
+    try:
+        out = classify_sentiment_llm(text)
+        just = out.get("justification", {})
+        keywords = just.get("keywords", [])
+        explanation = just.get("explanation", "")
+        sentiment_pred = out.get("sentiment", "")
+        conf = out.get("confidence_score", "")
+
+        results.append(out)
+
+        aug_rows.append(
+            {
+                "platform": row["platform"],
+                "text": text,
+                "label_original": row["Sentiment"],
+                "pred_sentiment": sentiment_pred,
+                "pred_confidence": conf,
+                "pred_keywords": ", ".join(map(str, keywords)),
+                "pred_explanation": explanation,
+            }
+        )
+
+        print(f"[{i+1}/6] ✓ Classified")
+    except Exception as e:
+        print(f"[{i+1}/6] Error: {e}")
+        aug_rows.append(
+            {
+                "platform": row["platform"],
+                "text": text,
+                "label_original": row["Sentiment"],
+                "pred_sentiment": "",
+                "pred_confidence": "",
+                "pred_keywords": "",
+                "pred_explanation": f"Error: {e}",
+            }
+        )
+
+# --- Save JSONL + CSV outputs ---
+jsonl_path = os.path.join(OUTPUT_DIR, "sentiment_llm_results.jsonl")
+csv_path = os.path.join(OUTPUT_DIR, "sentiment_llm_results.csv")
+
+with open(jsonl_path, "w", encoding="utf-8") as f:
+    for r in results:
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+pd.DataFrame(aug_rows).to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+print(f"Saved: {jsonl_path}")
+print(f"Saved: {csv_path}")
